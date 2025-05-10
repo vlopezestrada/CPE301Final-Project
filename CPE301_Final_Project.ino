@@ -14,7 +14,7 @@
 #define TBE 0x20
 #define DHT11_PIN 13
 #define WATER_THRESHOLD 75
-#define TEMP_THRESHOLD 26
+#define TEMP_THRESHOLD 30
 // UART Pointers
 volatile unsigned char *myUCSR0A = (unsigned char *)0x00C0;
 volatile unsigned char *myUCSR0B = (unsigned char *)0x00C1;
@@ -44,9 +44,10 @@ volatile unsigned char *portL = (unsigned char *)0x10B;
 const int RS = 5, EN = 4, D4 = 39, D5 = 37, D6 = 35, D7 = 33;
 LiquidCrystal lcd(RS, EN, D4, D5, D6, D7);
 volatile unsigned int waterLevel = 0;
+volatile unsigned int angleValue = 165;
 volatile unsigned long lastInterruptTimeIdle = 0;
 volatile unsigned long lastInterruptTimeDisabled = 0;
-const int stepsPerRevolution = 2038;
+const int stepsPerRevolution = 4038;
 Stepper myStepper = Stepper(stepsPerRevolution, 28, 24, 26, 22);
 dht DHT;
 RTC_DS1307 rtc;
@@ -55,7 +56,7 @@ int potVal = 0;
 volatile int ISRDflag = 0;
 volatile int ISRIflag = 0;
 enum SystemState {DISABLED, IDLE, RUNNING, ERROR};
-unsigned char* stateStrings [4] = {"DISABLED", "IDLE", "RUNNING", "ERROR"};
+const char* stateStrings [4] = {"DISABLED", "IDLE", "RUNNING", "ERROR"};
 volatile SystemState currentState = DISABLED;
 
 void setup() {
@@ -65,19 +66,19 @@ void setup() {
   adc_init();
   rtc.begin();
 
-#ifndef ESP8266
-  while (!Serial); // wait for serial port to connect. Needed for native USB
-#endif
+// #ifndef ESP8266
+//   while (!Serial); // wait for serial port to connect. Needed for native USB
+// #endif
 
-  if (! rtc.begin()) {
-    Serial.println("Couldn't find RTC");
-    Serial.flush();
-    while (1) delay(10);
-  }
-  if (! rtc.isrunning()) {
-    Serial.println("RTC is NOT running, let's set the time!");
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  }
+  // if (! rtc.begin()) {
+  //   Serial.println("Couldn't find RTC");
+  //   Serial.flush();
+  //   while (1) delay(10);
+  // }
+  // if (! rtc.isrunning()) {
+  //   Serial.println("RTC is NOT running, let's set the time!");
+  //   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  // }
   
   attachInterrupt(digitalPinToInterrupt(3), idleISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(2), disabledISR, LOW);
@@ -114,16 +115,13 @@ void loop() {
   int tempChk = DHT.read11(DHT11_PIN);
   // Read water level from ADC channel 0
   waterLevel = adc_read(0);
-
-  // Read potentiometer 
-  potVal = map(analogRead(A1),0,1024,0,500);
-  // Stepper motor movement with deadband threshold
-  const int stepThreshold = 10;
-  int delta = potVal - Pval;
-  if(abs(delta) > stepThreshold) {
-    int stepAmount = map(delta, -5000, 5000, -500, 500);
-    myStepper.step(stepAmount);
-    Pval = potVal;
+  angleValue = adc_read(2);
+  if(angleValue < 150) {
+    myStepper.step(-stepsPerRevolution);
+    angleChangeMsg(now);
+  }
+  else if(angleValue > 450) {
+    myStepper.step(stepsPerRevolution);
     angleChangeMsg(now);
   }
 
@@ -135,7 +133,7 @@ void loop() {
         idleState(now);
         ISRIflag = 0;
       }
-      if(DHT.temperature > TEMP_THRESHOLD){
+      if(DHT.temperature >= TEMP_THRESHOLD){
         currentState = RUNNING;
         printMonitor();
         runningState(now);
@@ -148,7 +146,7 @@ void loop() {
       break;
 
     case RUNNING:
-      if(DHT.temperature <= TEMP_THRESHOLD) {
+      if(DHT.temperature < TEMP_THRESHOLD) {
         currentState = IDLE;
         printMonitor();
         idleState(now);
@@ -161,7 +159,7 @@ void loop() {
       break;
 
     case ERROR:
-      if(waterLevel >= WATER_THRESHOLD && *pinB & 0x02){
+      if(waterLevel >= WATER_THRESHOLD && !(*pinB & 0x02)){
         currentState = IDLE;
         printMonitor();
         idleState(now);
@@ -199,6 +197,7 @@ void disabledISR() {
 void disabledState(DateTime now) {
   stateChange(now);
   // Turn off fan outputs
+  *portL |= 0x08;
   *portL &= ~(0x02);
   analogWrite(12, 0);
   *portH |= 0x10; // Write HIGH
@@ -210,6 +209,7 @@ void disabledState(DateTime now) {
 void idleState(DateTime now) {
   stateChange(now);
   // Turn off fan outputs
+  *portL |= 0x08;
   *portL &= ~(0x02);        
   analogWrite(12, 0);       
   currentState = IDLE;
@@ -222,7 +222,8 @@ void idleState(DateTime now) {
 void errorState(DateTime now) {
   stateChange(now);
   // Turn off fan outputs
-  *portL &= ~(0x02);        
+  *portL &= ~(0x02);
+  *portL |= 0x08;        
   analogWrite(12, 0);       
   *portH |= 0x40; // Write HIGH
   *portH &= ~(0x08); // Write LOW
@@ -239,7 +240,8 @@ void runningState(DateTime now) {
 
   // Run fan motor
   *portL |= 0x02;
-  analogWrite(12, 250);
+  *portL &= ~(0x08);
+  analogWrite(12, 255);
 }
 
 void printMonitor() {
@@ -351,7 +353,7 @@ void adc_init() {
   // clear bit 0-2 to 0 to set prescaler selection
   *my_ADCSRA &= 0b11111000;
   // set prescaler to 128
-  // *my_ADCSRA |= 0b00000111; 
+  *my_ADCSRA |= 0b00000111; 
   // setup the B register
   // clear bit 3 to 0 to reset the channel and gain bits
   *my_ADCSRB &= 0b11110111;
@@ -374,7 +376,7 @@ unsigned int adc_read(unsigned char adc_channel_num) {
   // clear the channel selection bits (MUX 5) hint: it's not in the ADMUX register
   *my_ADCSRB &= 0b11011111;
   // set the channel selection bits for channel 0
-  *my_ADMUX += adc_channel_num;
+  *my_ADMUX = (*my_ADMUX & 0b11100000) | (adc_channel_num & 0x07);
   // set bit 6 of ADCSRA to 1 to start a conversion
   *my_ADCSRA |= 0b01000000;
   // wait for the conversion to complete
